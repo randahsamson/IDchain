@@ -7,8 +7,11 @@
 (define-constant ERR_VERIFIER_NOT_AUTHORIZED (err u105))
 (define-constant ERR_PROFILE_SUSPENDED (err u106))
 (define-constant ERR_INVALID_DATA (err u107))
+(define-constant ERR_HISTORY_NOT_FOUND (err u108))
+(define-constant ERR_INVALID_HISTORY_TYPE (err u109))
 
 (define-data-var profile-counter uint u0)
+(define-data-var history-counter uint u0)
 (define-data-var contract-paused bool false)
 
 (define-map kyc-profiles
@@ -63,6 +66,121 @@
 
 (define-data-var request-counter uint u0)
 
+(define-map profile-history
+  { history-id: uint }
+  {
+    profile-id: uint,
+    action-type: (string-ascii 32),
+    old-value: (optional (string-ascii 128)),
+    new-value: (optional (string-ascii 128)),
+    field-name: (string-ascii 32),
+    changed-by: principal,
+    timestamp: uint,
+    transaction-id: (string-ascii 64),
+    additional-data: (optional (string-ascii 256))
+  }
+)
+
+(define-map profile-history-index
+  { profile-id: uint }
+  { 
+    history-count: uint,
+    last-updated: uint
+  }
+)
+
+(define-map history-analytics
+  { profile-id: uint, action-type: (string-ascii 32) }
+  {
+    count: uint,
+    first-occurrence: uint,
+    last-occurrence: uint
+  }
+)
+
+(define-map trusted-history-readers
+  { reader: principal }
+  {
+    authorized: bool,
+    access-level: uint,
+    granted-by: principal,
+    granted-at: uint
+  }
+)
+
+(define-private (record-history-entry (profile-id uint) (action-type (string-ascii 32)) (field-name (string-ascii 32)) (old-value (optional (string-ascii 128))) (new-value (optional (string-ascii 128))) (additional-data (optional (string-ascii 256))))
+  (let
+    (
+      (history-id (+ (var-get history-counter) u1))
+      (current-time stacks-block-height)
+      (tx-id (int-to-ascii (to-int stacks-block-height)))
+      (current-index (default-to { history-count: u0, last-updated: u0 } (map-get? profile-history-index { profile-id: profile-id })))
+      (current-analytics (default-to { count: u0, first-occurrence: u0, last-occurrence: u0 } (map-get? history-analytics { profile-id: profile-id, action-type: action-type })))
+    )
+    
+    (map-set profile-history
+      { history-id: history-id }
+      {
+        profile-id: profile-id,
+        action-type: action-type,
+        old-value: old-value,
+        new-value: new-value,
+        field-name: field-name,
+        changed-by: tx-sender,
+        timestamp: current-time,
+        transaction-id: tx-id,
+        additional-data: additional-data
+      }
+    )
+    
+    (map-set profile-history-index
+      { profile-id: profile-id }
+      {
+        history-count: (+ (get history-count current-index) u1),
+        last-updated: current-time
+      }
+    )
+    
+    (map-set history-analytics
+      { profile-id: profile-id, action-type: action-type }
+      {
+        count: (+ (get count current-analytics) u1),
+        first-occurrence: (if (is-eq (get count current-analytics) u0) current-time (get first-occurrence current-analytics)),
+        last-occurrence: current-time
+      }
+    )
+    
+    (var-set history-counter history-id)
+    (ok history-id)
+  )
+)
+
+(define-public (grant-history-access (reader principal) (access-level uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (<= access-level u3) ERR_INVALID_DATA)
+    
+    (map-set trusted-history-readers
+      { reader: reader }
+      {
+        authorized: true,
+        access-level: access-level,
+        granted-by: tx-sender,
+        granted-at: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (revoke-history-access (reader principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (map-delete trusted-history-readers { reader: reader })
+    (ok true)
+  )
+)
+
 (define-public (create-profile (metadata-hash (string-ascii 64)))
   (let
     (
@@ -93,6 +211,7 @@
     )
     
     (var-set profile-counter profile-id)
+    (unwrap-panic (record-history-entry profile-id "profile-created" "status" none (some "pending") (some metadata-hash)))
     (ok profile-id)
   )
 )
@@ -141,6 +260,7 @@
         updated-at: current-block
       })
     )
+    (unwrap-panic (record-history-entry profile-id "profile-verified" "status" (some (get status profile)) (some "verified") (some (int-to-ascii (to-int verification-level)))))
     (ok true)
   )
 )
@@ -300,4 +420,71 @@
 
 (define-read-only (is-contract-paused)
   (var-get contract-paused)
+)
+
+(define-read-only (get-history-entry (history-id uint))
+  (map-get? profile-history { history-id: history-id })
+)
+
+(define-read-only (get-profile-history-summary (profile-id uint))
+  (map-get? profile-history-index { profile-id: profile-id })
+)
+
+(define-read-only (get-history-analytics (profile-id uint) (action-type (string-ascii 32)))
+  (map-get? history-analytics { profile-id: profile-id, action-type: action-type })
+)
+
+(define-read-only (get-history-reader-access (reader principal))
+  (map-get? trusted-history-readers { reader: reader })
+)
+
+(define-read-only (can-read-history (profile-id uint) (reader principal))
+  (let
+    (
+      (profile (map-get? kyc-profiles { profile-id: profile-id }))
+      (reader-access (map-get? trusted-history-readers { reader: reader }))
+    )
+    (or
+      (and (is-some profile) (is-eq reader (get owner (unwrap-panic profile))))
+      (is-eq reader CONTRACT_OWNER)
+      (and (is-some reader-access) (get authorized (unwrap-panic reader-access)))
+    )
+  )
+)
+
+(define-read-only (get-total-history-entries)
+  (var-get history-counter)
+)
+
+(define-public (get-profile-history-range (profile-id uint) (start-id uint) (limit uint))
+  (let
+    (
+      (reader-authorized (can-read-history profile-id tx-sender))
+    )
+    (asserts! reader-authorized ERR_NOT_AUTHORIZED)
+    (asserts! (> limit u0) ERR_INVALID_DATA)
+    (asserts! (<= limit u50) ERR_INVALID_DATA)
+    
+    (ok (get-history-entries-by-range start-id limit profile-id))
+  )
+)
+
+(define-private (get-history-entries-by-range (start-id uint) (limit uint) (target-profile-id uint))
+  (let
+    (
+      (entry-1 (filter-history-entry start-id target-profile-id))
+      (entry-2 (filter-history-entry (+ start-id u1) target-profile-id))
+      (entry-3 (filter-history-entry (+ start-id u2) target-profile-id))
+      (entry-4 (filter-history-entry (+ start-id u3) target-profile-id))
+      (entry-5 (filter-history-entry (+ start-id u4) target-profile-id))
+    )
+    (list entry-1 entry-2 entry-3 entry-4 entry-5)
+  )
+)
+
+(define-private (filter-history-entry (history-id uint) (target-profile-id uint))
+  (match (map-get? profile-history { history-id: history-id })
+    entry (if (is-eq (get profile-id entry) target-profile-id) (some entry) none)
+    none
+  )
 )

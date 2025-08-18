@@ -9,10 +9,16 @@
 (define-constant ERR_INVALID_DATA (err u107))
 (define-constant ERR_HISTORY_NOT_FOUND (err u108))
 (define-constant ERR_INVALID_HISTORY_TYPE (err u109))
+(define-constant ERR_INVALID_REPUTATION_SCORE (err u110))
+(define-constant ERR_ENDORSEMENT_EXISTS (err u111))
+(define-constant ERR_SELF_ENDORSEMENT (err u112))
+(define-constant ERR_INSUFFICIENT_REPUTATION (err u113))
 
 (define-data-var profile-counter uint u0)
 (define-data-var history-counter uint u0)
 (define-data-var contract-paused bool false)
+(define-data-var endorsement-counter uint u0)
+(define-data-var reputation-decay-rate uint u10)
 
 (define-map kyc-profiles
   { profile-id: uint }
@@ -105,6 +111,57 @@
     access-level: uint,
     granted-by: principal,
     granted-at: uint
+  }
+)
+
+(define-map profile-reputation
+  { profile-id: uint }
+  {
+    base-score: uint,
+    verification-bonus: uint,
+    endorsement-score: uint,
+    time-penalty: uint,
+    last-updated: uint,
+    total-score: uint
+  }
+)
+
+(define-map verifier-reputation
+  { verifier: principal }
+  {
+    total-verifications: uint,
+    successful-verifications: uint,
+    reputation-weight: uint,
+    last-activity: uint
+  }
+)
+
+(define-map profile-endorsements
+  { endorsement-id: uint }
+  {
+    endorser-profile: uint,
+    endorsed-profile: uint,
+    endorsement-weight: uint,
+    endorsement-type: (string-ascii 32),
+    created-at: uint,
+    active: bool
+  }
+)
+
+(define-map endorsement-summary
+  { profile-id: uint }
+  {
+    total-endorsements: uint,
+    weighted-endorsement-score: uint,
+    last-endorsement: uint
+  }
+)
+
+(define-map reputation-thresholds
+  { threshold-name: (string-ascii 32) }
+  {
+    min-score: uint,
+    description: (string-ascii 64)
   }
 )
 
@@ -488,3 +545,201 @@
     none
   )
 )
+
+(define-private (calculate-reputation-score (profile-id uint))
+  (let
+    (
+      (profile (map-get? kyc-profiles { profile-id: profile-id }))
+      (current-reputation (default-to { base-score: u0, verification-bonus: u0, endorsement-score: u0, time-penalty: u0, last-updated: u0, total-score: u0 } (map-get? profile-reputation { profile-id: profile-id })))
+      (endorsement-data (default-to { total-endorsements: u0, weighted-endorsement-score: u0, last-endorsement: u0 } (map-get? endorsement-summary { profile-id: profile-id })))
+      (current-time stacks-block-height)
+    )
+    (match profile
+      prof-data (let
+        (
+          (base-score (if (is-eq (get status prof-data) "verified") u100 u0))
+          (verification-bonus (* (get verification-level prof-data) u20))
+          (time-since-verification (if (> (get verified-at prof-data) u0) (- current-time (get verified-at prof-data)) u0))
+          (time-penalty (/ (* time-since-verification (var-get reputation-decay-rate)) u1000))
+          (endorsement-score (get weighted-endorsement-score endorsement-data))
+          (total-score (if (> (+ base-score verification-bonus endorsement-score) time-penalty) (- (+ base-score verification-bonus endorsement-score) time-penalty) u0))
+        )
+        {
+          base-score: base-score,
+          verification-bonus: verification-bonus,
+          endorsement-score: endorsement-score,
+          time-penalty: time-penalty,
+          last-updated: current-time,
+          total-score: total-score
+        }
+      )
+      { base-score: u0, verification-bonus: u0, endorsement-score: u0, time-penalty: u0, last-updated: current-time, total-score: u0 }
+    )
+  )
+)
+
+(define-public (update-profile-reputation (profile-id uint))
+  (let
+    (
+      (new-reputation (calculate-reputation-score profile-id))
+    )
+    (asserts! (is-some (map-get? kyc-profiles { profile-id: profile-id })) ERR_PROFILE_NOT_FOUND)
+    
+    (map-set profile-reputation
+      { profile-id: profile-id }
+      new-reputation
+    )
+    (ok (get total-score new-reputation))
+  )
+)
+
+(define-public (endorse-profile (endorsed-profile-id uint) (endorsement-type (string-ascii 32)))
+  (let
+    (
+      (endorser-profile-data (map-get? user-profiles { user: tx-sender }))
+      (endorsed-profile (map-get? kyc-profiles { profile-id: endorsed-profile-id }))
+      (endorsement-id (+ (var-get endorsement-counter) u1))
+    )
+    (asserts! (is-some endorsed-profile) ERR_PROFILE_NOT_FOUND)
+    (asserts! (is-some endorser-profile-data) ERR_PROFILE_NOT_FOUND)
+    
+    (let
+      (
+        (endorser-profile-id (get profile-id (unwrap-panic endorser-profile-data)))
+        (endorser-reputation (map-get? profile-reputation { profile-id: endorser-profile-id }))
+      )
+      (asserts! (not (is-eq endorser-profile-id endorsed-profile-id)) ERR_SELF_ENDORSEMENT)
+      (asserts! (is-none (map-get? profile-endorsements { endorsement-id: endorsement-id })) ERR_ENDORSEMENT_EXISTS)
+      
+      (let
+        (
+          (endorsement-weight (if (is-some endorser-reputation) (/ (get total-score (unwrap-panic endorser-reputation)) u10) u5))
+          (current-summary (default-to { total-endorsements: u0, weighted-endorsement-score: u0, last-endorsement: u0 } (map-get? endorsement-summary { profile-id: endorsed-profile-id })))
+        )
+        (map-set profile-endorsements
+          { endorsement-id: endorsement-id }
+          {
+            endorser-profile: endorser-profile-id,
+            endorsed-profile: endorsed-profile-id,
+            endorsement-weight: endorsement-weight,
+            endorsement-type: endorsement-type,
+            created-at: stacks-block-height,
+            active: true
+          }
+        )
+        
+        (map-set endorsement-summary
+          { profile-id: endorsed-profile-id }
+          {
+            total-endorsements: (+ (get total-endorsements current-summary) u1),
+            weighted-endorsement-score: (+ (get weighted-endorsement-score current-summary) endorsement-weight),
+            last-endorsement: stacks-block-height
+          }
+        )
+        
+        (var-set endorsement-counter endorsement-id)
+        (unwrap-panic (update-profile-reputation endorsed-profile-id))
+        (ok endorsement-id)
+      )
+    )
+  )
+)
+
+(define-public (set-reputation-threshold (threshold-name (string-ascii 32)) (min-score uint) (description (string-ascii 64)))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (> min-score u0) ERR_INVALID_REPUTATION_SCORE)
+    
+    (map-set reputation-thresholds
+      { threshold-name: threshold-name }
+      {
+        min-score: min-score,
+        description: description
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-verifier-reputation (verifier principal) (verification-successful bool))
+  (let
+    (
+      (current-rep (default-to { total-verifications: u0, successful-verifications: u0, reputation-weight: u100, last-activity: u0 } (map-get? verifier-reputation { verifier: verifier })))
+    )
+    (asserts! (or (is-eq tx-sender CONTRACT_OWNER) (is-eq tx-sender verifier)) ERR_NOT_AUTHORIZED)
+    
+    (map-set verifier-reputation
+      { verifier: verifier }
+      {
+        total-verifications: (+ (get total-verifications current-rep) u1),
+        successful-verifications: (if verification-successful (+ (get successful-verifications current-rep) u1) (get successful-verifications current-rep)),
+        reputation-weight: (if verification-successful (if (> (+ (get reputation-weight current-rep) u5) u200) u200 (+ (get reputation-weight current-rep) u5)) (if (< (- (get reputation-weight current-rep) u10) u50) u50 (- (get reputation-weight current-rep) u10))),
+        last-activity: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-profile-reputation (profile-id uint))
+  (map-get? profile-reputation { profile-id: profile-id })
+)
+
+(define-read-only (get-verifier-reputation (verifier principal))
+  (map-get? verifier-reputation { verifier: verifier })
+)
+
+(define-read-only (get-endorsement-summary (profile-id uint))
+  (map-get? endorsement-summary { profile-id: profile-id })
+)
+
+(define-read-only (get-endorsement-details (endorsement-id uint))
+  (map-get? profile-endorsements { endorsement-id: endorsement-id })
+)
+
+(define-read-only (get-reputation-threshold (threshold-name (string-ascii 32)))
+  (map-get? reputation-thresholds { threshold-name: threshold-name })
+)
+
+(define-read-only (meets-reputation-threshold (profile-id uint) (threshold-name (string-ascii 32)))
+  (let
+    (
+      (reputation (map-get? profile-reputation { profile-id: profile-id }))
+      (threshold (map-get? reputation-thresholds { threshold-name: threshold-name }))
+    )
+    (and
+      (is-some reputation)
+      (is-some threshold)
+      (>= (get total-score (unwrap-panic reputation)) (get min-score (unwrap-panic threshold)))
+    )
+  )
+)
+
+(define-read-only (calculate-trust-score (profile-id uint))
+  (let
+    (
+      (reputation (map-get? profile-reputation { profile-id: profile-id }))
+      (profile (map-get? kyc-profiles { profile-id: profile-id }))
+    )
+    (match reputation
+      rep-data (match profile
+        prof-data (let
+          (
+            (verifier-rep (map-get? verifier-reputation { verifier: (get verifier prof-data) }))
+            (verifier-weight (if (is-some verifier-rep) (get reputation-weight (unwrap-panic verifier-rep)) u100))
+            (weighted-score (/ (* (get total-score rep-data) verifier-weight) u100))
+          )
+          weighted-score
+        )
+        u0
+      )
+      u0
+    )
+  )
+)
+
+
+
+
+
+

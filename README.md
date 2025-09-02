@@ -10,6 +10,9 @@ A Clarity smart contract for creating reusable, verified identity NFTs on the St
 - **📝 Profile Attributes**: Add and verify specific identity attributes
 - **🔄 Reusable Profiles**: Use verified identity across multiple platforms
 - **⏸️ Profile Management**: Suspend/activate profiles as needed
+- **⏱️ Profile Expiration & Renewal**: Automated expiration tracking with renewal workflows
+- **📈 Reputation System**: Advanced reputation scoring with endorsements
+- **📚 History Tracking**: Comprehensive audit trails for all profile activities
 
 ## 🚀 Getting Started
 
@@ -74,6 +77,27 @@ Users can add additional attributes to their profiles:
 (contract-call? .IDchain is-profile-verified u1 u2)
 ```
 
+### Profile Renewal Workflow
+
+Request profile renewal (available 2 days before expiration):
+
+```clarity
+(contract-call? .IDchain request-profile-renewal u1)
+```
+
+Verifiers can approve renewals:
+
+```clarity
+(contract-call? .IDchain approve-profile-renewal u1)
+```
+
+Check profile expiration status:
+
+```clarity
+(contract-call? .IDchain is-profile-expired u1)
+(contract-call? .IDchain is-profile-renewable u1)
+```
+
 ## 🔍 Read-Only Functions
 
 - `get-profile`: Get profile details by ID
@@ -97,8 +121,32 @@ Users can add additional attributes to their profiles:
 - **Level 2**: Enhanced verification  
 - **Level 3**: Premium verification
 
+## ⚡ System Features
+
+### Profile Expiration & Renewal System
+- **Automated Tracking**: Profiles expire after ~1 year (configurable)
+- **Grace Period**: 1-week grace period for late renewals
+- **Early Renewal**: Renew profiles 2 days before expiration
+- **Verifier Approval**: Structured approval workflow for renewals
+- **Auto-Renewal Support**: Users can enable auto-renewal preferences
+- **Comprehensive Analytics**: Track renewal statistics and history
+
+For detailed information, see [PROFILE_EXPIRATION_SYSTEM.md](PROFILE_EXPIRATION_SYSTEM.md)
+
+### Reputation System
+- **Trust Scoring**: Calculate weighted trust scores
+- **Profile Endorsements**: Community-based endorsements
+- **Verifier Reputation**: Track verifier performance
+- **Reputation Thresholds**: Configurable reputation levels
+
+### History & Analytics
+- **Complete Audit Trail**: Track all profile activities
+- **History Analytics**: Analyze activity patterns
+- **Access Control**: Granular history access permissions
+
 ## 🔧 Error Codes
 
+### Core Errors
 - `u100`: Not authorized
 - `u101`: Profile already exists
 - `u102`: Profile not found
@@ -107,6 +155,20 @@ Users can add additional attributes to their profiles:
 - `u105`: Verifier not authorized
 - `u106`: Profile suspended
 - `u107`: Invalid data
+
+### System Errors
+- `u108`: History not found
+- `u109`: Invalid history type
+- `u110`: Invalid reputation score
+- `u111`: Endorsement exists
+- `u112`: Self endorsement not allowed
+- `u113`: Insufficient reputation
+
+### Renewal System Errors
+- `u114`: Profile expired
+- `u115`: Renewal pending
+- `u116`: Not renewable
+- `u117`: Renewal not found
 
 ## 🤝 Contributing
 

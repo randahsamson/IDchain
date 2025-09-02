@@ -13,12 +13,19 @@
 (define-constant ERR_ENDORSEMENT_EXISTS (err u111))
 (define-constant ERR_SELF_ENDORSEMENT (err u112))
 (define-constant ERR_INSUFFICIENT_REPUTATION (err u113))
+(define-constant ERR_PROFILE_EXPIRED (err u114))
+(define-constant ERR_RENEWAL_PENDING (err u115))
+(define-constant ERR_NOT_RENEWABLE (err u116))
+(define-constant ERR_RENEWAL_NOT_FOUND (err u117))
 
 (define-data-var profile-counter uint u0)
 (define-data-var history-counter uint u0)
 (define-data-var contract-paused bool false)
 (define-data-var endorsement-counter uint u0)
 (define-data-var reputation-decay-rate uint u10)
+(define-data-var default-profile-validity-period uint u52560) ;; ~1 year in blocks
+(define-data-var renewal-grace-period uint u1440) ;; ~1 week grace period
+(define-data-var total-renewals uint u0)
 
 (define-map kyc-profiles
   { profile-id: uint }
@@ -165,6 +172,32 @@
   }
 )
 
+(define-map profile-expiration
+  { profile-id: uint }
+  {
+    expiry-block: uint,
+    renewal-count: uint,
+    last-renewal-block: uint,
+    auto-renewal-enabled: bool,
+    status: (string-ascii 20)
+  }
+)
+
+(define-map renewal-requests
+  { request-id: uint }
+  {
+    profile-id: uint,
+    requester: principal,
+    requested-at: uint,
+    status: (string-ascii 20),
+    processed-at: (optional uint),
+    processed-by: (optional principal),
+    new-expiry-block: (optional uint)
+  }
+)
+
+(define-data-var renewal-request-counter uint u0)
+
 (define-private (record-history-entry (profile-id uint) (action-type (string-ascii 32)) (field-name (string-ascii 32)) (old-value (optional (string-ascii 128))) (new-value (optional (string-ascii 128))) (additional-data (optional (string-ascii 256))))
   (let
     (
@@ -302,6 +335,7 @@
       (profile (unwrap! (map-get? kyc-profiles { profile-id: profile-id }) ERR_PROFILE_NOT_FOUND))
       (verifier-info (unwrap! (map-get? authorized-verifiers { verifier: tx-sender }) ERR_VERIFIER_NOT_AUTHORIZED))
       (current-block stacks-block-height)
+      (expiry-block (+ current-block (var-get default-profile-validity-period)))
     )
     (asserts! (get authorized verifier-info) ERR_VERIFIER_NOT_AUTHORIZED)
     (asserts! (<= verification-level (get verification-limit verifier-info)) ERR_INVALID_VERIFICATION_LEVEL)
@@ -317,6 +351,18 @@
         updated-at: current-block
       })
     )
+    
+    (map-set profile-expiration
+      { profile-id: profile-id }
+      {
+        expiry-block: expiry-block,
+        renewal-count: u0,
+        last-renewal-block: u0,
+        auto-renewal-enabled: false,
+        status: "active"
+      }
+    )
+    
     (unwrap-panic (record-history-entry profile-id "profile-verified" "status" (some (get status profile)) (some "verified") (some (int-to-ascii (to-int verification-level)))))
     (ok true)
   )
@@ -738,8 +784,267 @@
   )
 )
 
+;; =====================================
+;; PROFILE EXPIRATION & RENEWAL SYSTEM
+;; =====================================
 
+(define-public (request-profile-renewal (profile-id uint))
+  (let
+    (
+      (profile (unwrap! (map-get? kyc-profiles { profile-id: profile-id }) ERR_PROFILE_NOT_FOUND))
+      (expiration (map-get? profile-expiration { profile-id: profile-id }))
+      (request-id (+ (var-get renewal-request-counter) u1))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get owner profile)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-some expiration) ERR_PROFILE_NOT_FOUND)
+    
+    (let
+      (
+        (exp-data (unwrap-panic expiration))
+        (grace-period-end (+ (get expiry-block exp-data) (var-get renewal-grace-period)))
+      )
+      (asserts! (or
+        (>= current-block (get expiry-block exp-data))
+        (>= current-block (- (get expiry-block exp-data) u2880))) ERR_NOT_RENEWABLE) ;; Allow renewal 2 days before expiry
+      (asserts! (<= current-block grace-period-end) ERR_PROFILE_EXPIRED)
+      
+      (map-set renewal-requests
+        { request-id: request-id }
+        {
+          profile-id: profile-id,
+          requester: tx-sender,
+          requested-at: current-block,
+          status: "pending",
+          processed-at: none,
+          processed-by: none,
+          new-expiry-block: none
+        }
+      )
+      
+      (var-set renewal-request-counter request-id)
+      (unwrap-panic (record-history-entry profile-id "renewal-requested" "status" (some "active") (some "renewal-pending") none))
+      (ok request-id)
+    )
+  )
+)
 
+(define-public (approve-profile-renewal (request-id uint))
+  (let
+    (
+      (renewal-request (unwrap! (map-get? renewal-requests { request-id: request-id }) ERR_RENEWAL_NOT_FOUND))
+      (verifier-info (unwrap! (map-get? authorized-verifiers { verifier: tx-sender }) ERR_VERIFIER_NOT_AUTHORIZED))
+      (profile-id (get profile-id renewal-request))
+      (profile (unwrap! (map-get? kyc-profiles { profile-id: profile-id }) ERR_PROFILE_NOT_FOUND))
+      (expiration (unwrap! (map-get? profile-expiration { profile-id: profile-id }) ERR_PROFILE_NOT_FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (get authorized verifier-info) ERR_VERIFIER_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status renewal-request) "pending") ERR_INVALID_DATA)
+    
+    (let
+      (
+        (new-expiry-block (+ current-block (var-get default-profile-validity-period)))
+        (grace-period-end (+ (get expiry-block expiration) (var-get renewal-grace-period)))
+      )
+      (asserts! (<= current-block grace-period-end) ERR_PROFILE_EXPIRED)
+      
+      (map-set renewal-requests
+        { request-id: request-id }
+        (merge renewal-request {
+          status: "approved",
+          processed-at: (some current-block),
+          processed-by: (some tx-sender),
+          new-expiry-block: (some new-expiry-block)
+        })
+      )
+      
+      (map-set profile-expiration
+        { profile-id: profile-id }
+        (merge expiration {
+          expiry-block: new-expiry-block,
+          renewal-count: (+ (get renewal-count expiration) u1),
+          last-renewal-block: current-block,
+          status: "active"
+        })
+      )
+      
+      (var-set total-renewals (+ (var-get total-renewals) u1))
+      (unwrap-panic (record-history-entry profile-id "profile-renewed" "expiry-block" 
+        (some (int-to-ascii (to-int (get expiry-block expiration))))
+        (some (int-to-ascii (to-int new-expiry-block)))
+        (some (concat "renewal-" (int-to-ascii (to-int request-id))))))
+      (ok true)
+    )
+  )
+)
 
+(define-public (reject-profile-renewal (request-id uint) (reason (string-ascii 128)))
+  (let
+    (
+      (renewal-request (unwrap! (map-get? renewal-requests { request-id: request-id }) ERR_RENEWAL_NOT_FOUND))
+      (verifier-info (unwrap! (map-get? authorized-verifiers { verifier: tx-sender }) ERR_VERIFIER_NOT_AUTHORIZED))
+    )
+    (asserts! (get authorized verifier-info) ERR_VERIFIER_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status renewal-request) "pending") ERR_INVALID_DATA)
+    
+    (map-set renewal-requests
+      { request-id: request-id }
+      (merge renewal-request {
+        status: "rejected",
+        processed-at: (some stacks-block-height),
+        processed-by: (some tx-sender)
+      })
+    )
+    
+    (unwrap-panic (record-history-entry (get profile-id renewal-request) "renewal-rejected" "status" 
+      (some "renewal-pending") (some "renewal-rejected") (some reason)))
+    (ok true)
+  )
+)
 
+(define-public (expire-profile (profile-id uint))
+  (let
+    (
+      (profile (unwrap! (map-get? kyc-profiles { profile-id: profile-id }) ERR_PROFILE_NOT_FOUND))
+      (expiration (unwrap! (map-get? profile-expiration { profile-id: profile-id }) ERR_PROFILE_NOT_FOUND))
+      (current-block stacks-block-height)
+      (grace-period-end (+ (get expiry-block expiration) (var-get renewal-grace-period)))
+    )
+    (asserts! (or (is-eq tx-sender CONTRACT_OWNER) (is-eq tx-sender (get verifier profile))) ERR_NOT_AUTHORIZED)
+    (asserts! (> current-block grace-period-end) ERR_NOT_RENEWABLE)
+    (asserts! (not (is-eq (get status expiration) "expired")) ERR_PROFILE_EXPIRED)
+    
+    (map-set kyc-profiles
+      { profile-id: profile-id }
+      (merge profile {
+        status: "expired",
+        updated-at: current-block
+      })
+    )
+    
+    (map-set profile-expiration
+      { profile-id: profile-id }
+      (merge expiration {
+        status: "expired"
+      })
+    )
+    
+    (unwrap-panic (record-history-entry profile-id "profile-expired" "status" 
+      (some (get status profile)) (some "expired") none))
+    (ok true)
+  )
+)
 
+(define-public (set-auto-renewal (profile-id uint) (enabled bool))
+  (let
+    (
+      (profile (unwrap! (map-get? kyc-profiles { profile-id: profile-id }) ERR_PROFILE_NOT_FOUND))
+      (expiration (unwrap! (map-get? profile-expiration { profile-id: profile-id }) ERR_PROFILE_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get owner profile)) ERR_NOT_AUTHORIZED)
+    
+    (map-set profile-expiration
+      { profile-id: profile-id }
+      (merge expiration {
+        auto-renewal-enabled: enabled
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-validity-period (new-period uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (> new-period u0) ERR_INVALID_DATA)
+    (asserts! (<= new-period u105120) ERR_INVALID_DATA) ;; Max 2 years
+    
+    (var-set default-profile-validity-period new-period)
+    (ok true)
+  )
+)
+
+(define-public (update-grace-period (new-grace-period uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (> new-grace-period u0) ERR_INVALID_DATA)
+    (asserts! (<= new-grace-period u10080) ERR_INVALID_DATA) ;; Max 1 week
+    
+    (var-set renewal-grace-period new-grace-period)
+    (ok true)
+  )
+)
+
+;; =====================================
+;; READ-ONLY FUNCTIONS FOR RENEWAL SYSTEM
+;; =====================================
+
+(define-read-only (get-profile-expiration (profile-id uint))
+  (map-get? profile-expiration { profile-id: profile-id })
+)
+
+(define-read-only (get-renewal-request (request-id uint))
+  (map-get? renewal-requests { request-id: request-id })
+)
+
+(define-read-only (is-profile-expired (profile-id uint))
+  (match (map-get? profile-expiration { profile-id: profile-id })
+    expiration (> stacks-block-height (get expiry-block expiration))
+    false
+  )
+)
+
+(define-read-only (is-profile-in-grace-period (profile-id uint))
+  (match (map-get? profile-expiration { profile-id: profile-id })
+    expiration (let
+      (
+        (current-block stacks-block-height)
+        (expiry-block (get expiry-block expiration))
+        (grace-period-end (+ expiry-block (var-get renewal-grace-period)))
+      )
+      (and (> current-block expiry-block) (<= current-block grace-period-end))
+    )
+    false
+  )
+)
+
+(define-read-only (is-profile-renewable (profile-id uint))
+  (match (map-get? profile-expiration { profile-id: profile-id })
+    expiration (let
+      (
+        (current-block stacks-block-height)
+        (expiry-block (get expiry-block expiration))
+        (renewal-window-start (- expiry-block u2880)) ;; 2 days before expiry
+        (grace-period-end (+ expiry-block (var-get renewal-grace-period)))
+      )
+      (and 
+        (>= current-block renewal-window-start)
+        (<= current-block grace-period-end)
+      )
+    )
+    false
+  )
+)
+
+(define-read-only (get-renewal-statistics)
+  {
+    total-renewals: (var-get total-renewals),
+    renewal-request-counter: (var-get renewal-request-counter),
+    default-validity-period: (var-get default-profile-validity-period),
+    grace-period: (var-get renewal-grace-period)
+  }
+)
+
+(define-read-only (get-profile-renewal-history (profile-id uint))
+  (match (map-get? profile-expiration { profile-id: profile-id })
+    expiration (some {
+      renewal-count: (get renewal-count expiration),
+      last-renewal-block: (get last-renewal-block expiration),
+      current-expiry: (get expiry-block expiration),
+      auto-renewal-enabled: (get auto-renewal-enabled expiration),
+      status: (get status expiration)
+    })
+    none
+  )
+)
